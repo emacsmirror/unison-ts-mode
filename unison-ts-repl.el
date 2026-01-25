@@ -826,10 +826,29 @@ Displays result with TITLE when complete."
        (unison-ts--display-mcp-result result "test")))))
 
 ;;;###autoload
+(defun unison-ts-eval (expr)
+  "Evaluate a Unison expression via MCP.
+EXPR is evaluated using the typecheck-code tool with > prefix.
+Works for both pure functions and IO actions."
+  (interactive "sExpression: ")
+  (let ((ctx (unison-ts-mcp--get-project-context)))
+    (unless ctx
+      (user-error "No Unison project context found. Open a project first"))
+    (unison-ts-mcp--call-tool
+     "typecheck-code"
+     (append (unison-ts-mcp--make-project-context
+              (alist-get 'projectName ctx)
+              (alist-get 'branchName ctx))
+             `((code . ((sourceCode . ,(concat "> " expr))))))
+     (lambda (result)
+       (unison-ts--display-mcp-result result "eval")))))
+
+;;;###autoload
 (defun unison-ts-run ()
-  "Run a term from the codebase via MCP."
+  "Run an IO action from the codebase via MCP.
+For pure expressions, use `unison-ts-eval' instead."
   (interactive)
-  (let ((term (read-string "Term to run: "))
+  (let ((term (read-string "IO action to run: "))
         (ctx (unison-ts-mcp--get-project-context)))
     (unless ctx
       (user-error "No Unison project context found. Open a project first"))
@@ -838,7 +857,8 @@ Displays result with TITLE when complete."
      (append (unison-ts-mcp--make-project-context
               (alist-get 'projectName ctx)
               (alist-get 'branchName ctx))
-             `((definition . ,term)))
+             `((mainFunctionName . ,term)
+               (args . [])))
      (lambda (result)
        (unison-ts--display-mcp-result result "run")))))
 
@@ -857,7 +877,7 @@ Displays result with TITLE when complete."
      (append (unison-ts-mcp--make-project-context
               (alist-get 'projectName ctx)
               (alist-get 'branchName ctx))
-             `((code . ((text . ,code)))))
+             `((code . ((sourceCode . ,code)))))
      (lambda (result)
        (unison-ts--display-mcp-result result "watch")))))
 
