@@ -476,8 +476,8 @@ Examples:
                             (error text))))
               (if (and (listp parsed) (not (stringp parsed)))
                   ;; Structured response - deduplicate messages
-                  (let ((errors (seq-uniq (append (alist-get 'errorMessages parsed) nil)))
-                        (outputs (seq-uniq (append (alist-get 'outputMessages parsed) nil))))
+                  (let ((errors (unison-ts--dedupe-messages (alist-get 'errorMessages parsed)))
+                        (outputs (unison-ts--dedupe-messages (alist-get 'outputMessages parsed))))
                     (concat
                      (when (and errors (> (length errors) 0))
                        (concat "Errors:\n"
@@ -673,6 +673,17 @@ Works with both subprocess-based and MCP-based REPLs."
           text))
     (error text)))
 
+(defun unison-ts--dedupe-messages (messages)
+  "Remove duplicate MESSAGES, normalizing whitespace for comparison."
+  (let ((seen (make-hash-table :test 'equal))
+        (result nil))
+    (dolist (msg (append messages nil))
+      (let ((key (string-trim msg)))
+        (unless (gethash key seen)
+          (puthash key t seen)
+          (push msg result))))
+    (nreverse result)))
+
 (defun unison-ts--display-mcp-result (result title)
   "Display MCP RESULT appropriately based on content.
 Short success messages go to minibuffer, errors/long output to a buffer."
@@ -684,10 +695,10 @@ Short success messages go to minibuffer, errors/long output to a buffer."
              (text (alist-get 'text content))
              (parsed (when text (unison-ts--parse-mcp-output text))))
         (if (and (listp parsed) (not (stringp parsed)))
-            (let ((errors (seq-uniq (append (alist-get 'errorMessages parsed) nil)))
+            (let ((errors (unison-ts--dedupe-messages (alist-get 'errorMessages parsed)))
                   (outputs (seq-filter
                             (lambda (msg) (not (string-match-p "^Loading changes" msg)))
-                            (seq-uniq (append (alist-get 'outputMessages parsed) nil)))))
+                            (unison-ts--dedupe-messages (alist-get 'outputMessages parsed)))))
               (if (= (length errors) 0)
                   ;; Success → minibuffer
                   (message "UCM: %s" (string-join outputs " "))
