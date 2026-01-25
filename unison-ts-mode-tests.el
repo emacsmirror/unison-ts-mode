@@ -1354,11 +1354,6 @@
   (let ((unison-ts-lsp-port 59998))
     (should-not (unison-ts-api--lsp-running-p))))
 
-(ert-deftest unison-ts-api/headless-conflict-message ()
-  "Headless conflict detection should provide appropriate message."
-  (require 'unison-ts-repl)
-  (should (fboundp 'unison-ts-api--headless-conflict-p)))
-
 (ert-deftest unison-ts-api/repl-start-checks-lsp ()
   "REPL start should check for LSP conflicts."
   (require 'unison-ts-repl)

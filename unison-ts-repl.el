@@ -65,11 +65,6 @@ Set to nil to disable auto-close."
     (params . ,params)
     (id . ,unison-ts-mcp--request-id)))
 
-(defcustom unison-ts-mcp-timeout 30
-  "Timeout in seconds for MCP requests."
-  :type 'integer
-  :group 'unison-ts-repl)
-
 (defun unison-ts-mcp--call (requests)
   "Send REQUESTS to ucm mcp and return list of responses.
 REQUESTS is a list of (method . params) cons cells.
@@ -103,9 +98,11 @@ Uses synchronous subprocess call to avoid async complexity."
          ;; Parse responses (skip first one which is init response)
          (lines (split-string output "\n" t))
          (responses (mapcar (lambda (line)
-                              (condition-case nil
+                              (condition-case _err
                                   (json-read-from-string line)
-                                (error nil)))
+                                (error
+                                 (message "Warning: Failed to parse MCP response: %s" line)
+                                 nil)))
                             lines)))
     ;; Return responses after init (skip first)
     (cdr responses)))
@@ -129,37 +126,47 @@ Uses synchronous subprocess call to avoid async complexity."
         (when (and content (equal (alist-get 'type content) "text"))
           (json-read-from-string (alist-get 'text content)))))))
 
-(defun unison-ts-mcp--update-definitions (code)
-  "Update definitions with CODE via MCP."
+(defun unison-ts-mcp--with-project-context (func)
+  "Call FUNC with project-name and branch-name from current context.
+FUNC should accept two arguments: project-name and branch-name.
+Signals an error if no project context is found."
   (let ((ctx (unison-ts-mcp--get-project-context)))
     (unless ctx
       (user-error "No Unison project context found. Open a project first"))
-    (unison-ts-mcp--call-tool
-     "update-definitions"
-     `((projectContext . ((projectName . ,(alist-get 'projectName ctx))
-                          (branchName . ,(alist-get 'branchName ctx))))
-       (code . ((text . ,code)))))))
+    (funcall func
+             (alist-get 'projectName ctx)
+             (alist-get 'branchName ctx))))
+
+(defun unison-ts-mcp--make-project-context (project-name branch-name)
+  "Create a projectContext alist from PROJECT-NAME and BRANCH-NAME."
+  `((projectContext . ((projectName . ,project-name)
+                       (branchName . ,branch-name)))))
+
+(defun unison-ts-mcp--update-definitions (code)
+  "Update definitions with CODE via MCP."
+  (unison-ts-mcp--with-project-context
+   (lambda (project-name branch-name)
+     (unison-ts-mcp--call-tool
+      "update-definitions"
+      (append (unison-ts-mcp--make-project-context project-name branch-name)
+              `((code . ((text . ,code)))))))))
 
 (defun unison-ts-mcp--run-tests ()
   "Run tests in current project via MCP."
-  (let ((ctx (unison-ts-mcp--get-project-context)))
-    (unless ctx
-      (user-error "No Unison project context found. Open a project first"))
-    (unison-ts-mcp--call-tool
-     "run-tests"
-     `((projectContext . ((projectName . ,(alist-get 'projectName ctx))
-                          (branchName . ,(alist-get 'branchName ctx))))))))
+  (unison-ts-mcp--with-project-context
+   (lambda (project-name branch-name)
+     (unison-ts-mcp--call-tool
+      "run-tests"
+      (unison-ts-mcp--make-project-context project-name branch-name)))))
 
 (defun unison-ts-mcp--run (definition)
   "Run DEFINITION in current project via MCP."
-  (let ((ctx (unison-ts-mcp--get-project-context)))
-    (unless ctx
-      (user-error "No Unison project context found. Open a project first"))
-    (unison-ts-mcp--call-tool
-     "run"
-     `((projectContext . ((projectName . ,(alist-get 'projectName ctx))
-                          (branchName . ,(alist-get 'branchName ctx))))
-       (definition . ,definition)))))
+  (unison-ts-mcp--with-project-context
+   (lambda (project-name branch-name)
+     (unison-ts-mcp--call-tool
+      "run"
+      (append (unison-ts-mcp--make-project-context project-name branch-name)
+              `((definition . ,definition)))))))
 
 ;;; UCM API Integration (Legacy HTTP API)
 ;;
@@ -208,23 +215,9 @@ This is the default port UCM uses for LSP (language server protocol)."
   "Return non-nil if UCM LSP server is running."
   (unison-ts-api--port-open-p unison-ts-lsp-port))
 
-(defun unison-ts-api--headless-conflict-p ()
-  "Return non-nil if there's a potential conflict with headless UCM.
-This checks if the LSP port is in use, indicating eglot/lsp-mode
-started a headless UCM that would conflict with a new REPL instance."
-  (unison-ts-api--lsp-running-p))
-
 (defun unison-ts-api--server-running-p ()
   "Return non-nil if a UCM headless server is accepting connections."
-  (condition-case nil
-      (let ((proc (make-network-process
-                   :name "unison-api-check"
-                   :host unison-ts-api-host
-                   :service unison-ts-api-port
-                   :nowait nil)))
-        (delete-process proc)
-        t)
-    (error nil)))
+  (unison-ts-api--port-open-p unison-ts-api-port))
 
 (defun unison-ts-api--get-endpoint ()
   "Return the UCM API base endpoint URL."
@@ -364,7 +357,12 @@ Returns the buffer or nil."
 (define-derived-mode unison-ts-mcp-repl-mode fundamental-mode "UCM-MCP"
   "Major mode for interacting with UCM via MCP protocol.
 This mode sends commands to UCM via MCP, avoiding codebase lock
-conflicts with headless UCM (LSP)."
+conflicts with headless UCM (LSP).
+
+Key bindings:
+\\{unison-ts-mcp-repl-mode-map}
+
+Type `help' in the REPL for available commands."
   :group 'unison-ts-repl
   (setq-local unison-ts-mcp-repl--input-start (make-marker)))
 
@@ -688,8 +686,8 @@ otherwise starts a subprocess-based REPL."
 (defun unison-ts-repl ()
   "Switch to UCM REPL buffer, starting UCM if needed.
 When headless UCM is running (e.g., via LSP/eglot), uses an
-API-based REPL that communicates via HTTP to avoid codebase
-lock conflicts. Otherwise, starts a traditional subprocess REPL."
+MCP-based REPL that communicates via the MCP protocol to avoid
+codebase lock conflicts. Otherwise, starts a traditional subprocess REPL."
   (interactive)
   (let ((buf (or (unison-ts-repl--get-buffer)
                  (unison-ts-repl--start))))
