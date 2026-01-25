@@ -475,20 +475,21 @@ Examples:
                               (json-read-from-string text)
                             (error text))))
               (if (and (listp parsed) (not (stringp parsed)))
-                  ;; Structured response - deduplicate messages
-                  (let ((errors (unison-ts--dedupe-messages (alist-get 'errorMessages parsed)))
-                        (outputs (unison-ts--dedupe-messages (alist-get 'outputMessages parsed))))
+                  ;; Structured response - deduplicate messages and filter errors from outputs
+                  (let* ((errors (unison-ts--dedupe-messages (alist-get 'errorMessages parsed)))
+                         (error-keys (mapcar #'string-trim errors))
+                         (outputs (seq-filter
+                                   (lambda (m)
+                                     (and (not (string-match-p "^Loading changes" m))
+                                          (not (member (string-trim m) error-keys))))
+                                   (unison-ts--dedupe-messages (alist-get 'outputMessages parsed)))))
                     (concat
                      (when (and errors (> (length errors) 0))
                        (concat "Errors:\n"
                                (mapconcat #'identity errors "\n")
                                "\n"))
                      (when (and outputs (> (length outputs) 0))
-                       (mapconcat #'identity
-                                  (seq-filter
-                                   (lambda (m) (not (string-match-p "^Loading changes" m)))
-                                   outputs)
-                                  "\n"))))
+                       (mapconcat #'identity outputs "\n"))))
                 ;; Plain text
                 (format "%s" parsed)))
           "(no content)"))
@@ -695,10 +696,13 @@ Short success messages go to minibuffer, errors/long output to a buffer."
              (text (alist-get 'text content))
              (parsed (when text (unison-ts--parse-mcp-output text))))
         (if (and (listp parsed) (not (stringp parsed)))
-            (let ((errors (unison-ts--dedupe-messages (alist-get 'errorMessages parsed)))
-                  (outputs (seq-filter
-                            (lambda (msg) (not (string-match-p "^Loading changes" msg)))
-                            (unison-ts--dedupe-messages (alist-get 'outputMessages parsed)))))
+            (let* ((errors (unison-ts--dedupe-messages (alist-get 'errorMessages parsed)))
+                   (error-keys (mapcar #'string-trim errors))
+                   (outputs (seq-filter
+                             (lambda (msg)
+                               (and (not (string-match-p "^Loading changes" msg))
+                                    (not (member (string-trim msg) error-keys))))
+                             (unison-ts--dedupe-messages (alist-get 'outputMessages parsed)))))
               (if (= (length errors) 0)
                   ;; Success → minibuffer
                   (message "UCM: %s" (string-join outputs " "))
