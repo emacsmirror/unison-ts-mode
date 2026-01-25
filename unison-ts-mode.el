@@ -200,6 +200,19 @@ Starts UCM in headless mode if not already running."
       (sleep-for 1))
     (list "127.0.0.1" (string-to-number port))))
 
+(defun unison-ts-mode--kill-ucm-lsp (&rest _)
+  "Kill any UCM process listening on the LSP port.
+Called after eglot shuts down to clean up orphaned UCM processes."
+  (let ((port (string-to-number (or (getenv "UNISON_LSP_PORT") "5757"))))
+    (when-let ((output (shell-command-to-string
+                        (format "lsof -t -i :%d 2>/dev/null" port))))
+      (dolist (pid (split-string output "\n" t))
+        (when (string-match-p "^[0-9]+$" pid)
+          (ignore-errors
+            (signal-process (string-to-number pid) 'TERM)))))))
+
+(declare-function eglot-shutdown "ext:eglot")
+
 ;;;###autoload
 (defun unison-ts-mode-setup-eglot ()
   "Set up eglot for `unison-ts-mode'.
@@ -208,7 +221,9 @@ Call this from your init file:
     (with-eval-after-load \\='eglot
       (unison-ts-mode-setup-eglot)))"
   (add-to-list 'eglot-server-programs
-               '(unison-ts-mode . unison-ts-mode--eglot-contact)))
+               '(unison-ts-mode . unison-ts-mode--eglot-contact))
+  ;; Clean up UCM process after eglot shuts down (or times out)
+  (advice-add 'eglot-shutdown :after #'unison-ts-mode--kill-ucm-lsp))
 
 ;;;###autoload
 (defun unison-ts-mode-setup-lsp ()
