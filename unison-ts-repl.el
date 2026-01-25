@@ -475,19 +475,19 @@ Examples:
                               (json-read-from-string text)
                             (error text))))
               (if (and (listp parsed) (not (stringp parsed)))
-                  ;; Structured response
-                  (let ((errors (alist-get 'errorMessages parsed))
-                        (outputs (alist-get 'outputMessages parsed)))
+                  ;; Structured response - deduplicate messages
+                  (let ((errors (seq-uniq (append (alist-get 'errorMessages parsed) nil)))
+                        (outputs (seq-uniq (append (alist-get 'outputMessages parsed) nil))))
                     (concat
                      (when (and errors (> (length errors) 0))
                        (concat "Errors:\n"
-                               (mapconcat #'identity (append errors nil) "\n")
+                               (mapconcat #'identity errors "\n")
                                "\n"))
                      (when (and outputs (> (length outputs) 0))
                        (mapconcat #'identity
                                   (seq-filter
                                    (lambda (m) (not (string-match-p "^Loading changes" m)))
-                                   (append outputs nil))
+                                   outputs)
                                   "\n"))))
                 ;; Plain text
                 (format "%s" parsed)))
