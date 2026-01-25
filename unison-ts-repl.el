@@ -514,6 +514,7 @@ Examples:
                          (outputs (seq-filter
                                    (lambda (m)
                                      (and (not (string-match-p "^Loading changes" m))
+                                          (not (string-match-p "^No changes found" m))
                                           (not (member (string-trim m) error-keys))))
                                    (unison-ts--dedupe-messages (alist-get 'outputMessages parsed)))))
                     (concat
@@ -738,6 +739,7 @@ Short success messages go to minibuffer, errors/long output to a buffer."
                    (outputs (seq-filter
                              (lambda (msg)
                                (and (not (string-match-p "^Loading changes" msg))
+                                    (not (string-match-p "^No changes found" msg))
                                     (not (member (string-trim msg) error-keys))))
                              (unison-ts--dedupe-messages (alist-get 'outputMessages parsed)))))
               (if (= (length errors) 0)
