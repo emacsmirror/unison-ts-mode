@@ -296,12 +296,16 @@ Signals an error if UCM is not found."
     (seq-difference all-pids emacs-ucm-pids)))
 
 (defun unison-ts--find-ucm-buffer ()
-  "Find any buffer running UCM (term, vterm, eshell, shell).
+  "Find any buffer running UCM (term, vterm, eshell, shell, or MCP REPL).
 Returns the buffer or nil."
   (seq-find (lambda (buf)
               (with-current-buffer buf
-                (and (process-live-p (get-buffer-process buf))
-                     (string-match-p "ucm" (buffer-name buf)))))
+                (or
+                 ;; MCP REPL mode buffer
+                 (derived-mode-p 'unison-ts-mcp-repl-mode)
+                 ;; Process-based UCM buffer
+                 (and (process-live-p (get-buffer-process buf))
+                      (string-match-p "ucm" (buffer-name buf))))))
             (buffer-list)))
 
 (defun unison-ts--kill-external-ucm ()
@@ -312,6 +316,8 @@ Returns the buffer or nil."
         (signal-process pid 'TERM))
       (sit-for 0.5))))
 
+;;; Comint-based REPL (when no headless UCM is running)
+
 (defvar unison-ts-repl-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c M-o") #'comint-clear-buffer)
@@ -319,46 +325,356 @@ Returns the buffer or nil."
   "Keymap for `unison-ts-repl-mode'.")
 
 (define-derived-mode unison-ts-repl-mode comint-mode "UCM"
-  "Major mode for interacting with UCM."
+  "Major mode for interacting with UCM via subprocess."
   :group 'unison-ts-repl
   (setq-local comint-prompt-regexp "^[^>\n]*> ")
   (setq-local comint-prompt-read-only t)
   (setq-local comint-process-echoes nil))
+
+;;; MCP-based REPL (when headless UCM is running)
+;;
+;; This mode provides a REPL-like interface that sends commands via MCP
+;; to avoid codebase lock conflicts with the running headless UCM.
+;;
+;; Supported commands:
+;;   > <code>           - Evaluate a Unison expression (watch/typecheck)
+;;   add <code>         - Add/update definitions
+;;   test [namespace]   - Run tests
+;;   run <name> [args]  - Run a function
+;;   view <names>       - View definition source
+;;   find <query>       - Search by name
+;;   find : <type>      - Search by type
+;;   docs <name>        - Show documentation
+;;   help               - Show available commands
+
+(defvar-local unison-ts-mcp-repl--input-start nil
+  "Marker for the start of user input in MCP REPL buffer.")
+
+(defvar-local unison-ts-mcp-repl--project-root nil
+  "Project root associated with this MCP REPL buffer.")
+
+(defvar unison-ts-mcp-repl-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'unison-ts-mcp-repl-send)
+    (define-key map (kbd "C-c M-o") #'unison-ts-mcp-repl-clear)
+    (define-key map (kbd "C-a") #'unison-ts-mcp-repl-bol)
+    map)
+  "Keymap for `unison-ts-mcp-repl-mode'.")
+
+(define-derived-mode unison-ts-mcp-repl-mode fundamental-mode "UCM-MCP"
+  "Major mode for interacting with UCM via MCP protocol.
+This mode sends commands to UCM via MCP, avoiding codebase lock
+conflicts with headless UCM (LSP)."
+  :group 'unison-ts-repl
+  (setq-local unison-ts-mcp-repl--input-start (make-marker)))
+
+(defun unison-ts-mcp-repl--insert-prompt ()
+  "Insert the REPL prompt and set up input marker."
+  (let ((inhibit-read-only t))
+    (goto-char (point-max))
+    (insert (propertize (format "%s> " (or (file-name-nondirectory
+                                            (directory-file-name
+                                             (or unison-ts-mcp-repl--project-root
+                                                 default-directory)))
+                                           "ucm"))
+                        'face 'comint-highlight-prompt
+                        'read-only t
+                        'rear-nonsticky t))
+    (set-marker unison-ts-mcp-repl--input-start (point))))
+
+(defun unison-ts-mcp-repl-bol ()
+  "Move to beginning of line, but after the prompt."
+  (interactive)
+  (let ((prompt-end (marker-position unison-ts-mcp-repl--input-start)))
+    (if (and prompt-end (>= (point) prompt-end)
+             (= (line-number-at-pos) (line-number-at-pos prompt-end)))
+        (goto-char prompt-end)
+      (beginning-of-line))))
+
+(defun unison-ts-mcp-repl--get-input ()
+  "Get the current input from the REPL buffer."
+  (buffer-substring-no-properties
+   (marker-position unison-ts-mcp-repl--input-start)
+   (point-max)))
+
+(defconst unison-ts-mcp-repl--help-text
+  "UCM MCP REPL Commands:
+
+  > <expr>          Evaluate/typecheck a Unison expression
+  add <code>        Add or update definitions
+  test [namespace]  Run tests (optionally in a namespace)
+  run <name> [args] Execute a function
+  view <names>      View definition source code
+  find <query>      Search definitions by name
+  find : <type>     Search definitions by type signature
+  docs <name>       Show documentation for a definition
+  help              Show this help message
+
+Examples:
+  > 1 + 2
+  > List.map (x -> x + 1) [1, 2, 3]
+  add myFunc x = x + 1
+  test
+  run main
+  view List.map
+  find foldl
+  find : [a] -> a
+  docs Optional.map
+"
+  "Help text for MCP REPL commands.")
+
+(defun unison-ts-mcp-repl--parse-command (input)
+  "Parse INPUT into (command . args) cons cell."
+  (let ((trimmed (string-trim input)))
+    (cond
+     ;; Empty input
+     ((string-empty-p trimmed)
+      nil)
+     ;; Help
+     ((string-match-p "^help\\s-*$" trimmed)
+      (cons 'help nil))
+     ;; Watch/evaluate: starts with >
+     ((string-match "^>\\s-*\\(.*\\)" trimmed)
+      (cons 'watch (match-string 1 trimmed)))
+     ;; Add definitions
+     ((string-match "^add\\s-+\\(.*\\)" trimmed)
+      (cons 'add (match-string 1 trimmed)))
+     ;; Test
+     ((string-match "^test\\(?:\\s-+\\(.*\\)\\)?$" trimmed)
+      (cons 'test (match-string 1 trimmed)))
+     ;; Run
+     ((string-match "^run\\s-+\\(\\S-+\\)\\(?:\\s-+\\(.*\\)\\)?$" trimmed)
+      (cons 'run (cons (match-string 1 trimmed)
+                       (when (match-string 2 trimmed)
+                         (split-string (match-string 2 trimmed))))))
+     ;; View
+     ((string-match "^view\\s-+\\(.*\\)" trimmed)
+      (cons 'view (split-string (match-string 1 trimmed))))
+     ;; Find by type (find : <type>)
+     ((string-match "^find\\s-*:\\s-*\\(.*\\)" trimmed)
+      (cons 'find-type (match-string 1 trimmed)))
+     ;; Find by name
+     ((string-match "^find\\s-+\\(.*\\)" trimmed)
+      (cons 'find-name (match-string 1 trimmed)))
+     ;; Docs
+     ((string-match "^docs\\s-+\\(\\S-+\\)" trimmed)
+      (cons 'docs (match-string 1 trimmed)))
+     ;; Default: treat as code to evaluate
+     (t
+      (cons 'watch trimmed)))))
+
+(defun unison-ts-mcp-repl--execute (command args)
+  "Execute MCP COMMAND with ARGS and return result string."
+  (let* ((default-directory (or unison-ts-mcp-repl--project-root
+                                default-directory))
+         (ctx (unison-ts-mcp--get-project-context)))
+    (unless ctx
+      (user-error "No Unison project context found"))
+    (let ((project-name (alist-get 'projectName ctx))
+          (branch-name (alist-get 'branchName ctx)))
+      (pcase command
+        ('help
+         unison-ts-mcp-repl--help-text)
+        ('watch
+         (unison-ts-mcp-repl--format-result
+          (unison-ts-mcp--call-tool
+           "typecheck-code"
+           `((projectContext . ((projectName . ,project-name)
+                                (branchName . ,branch-name)))
+             (code . ((sourceCode . ,(if (string-prefix-p ">" args)
+                                         args
+                                       (concat "> " args)))))))))
+        ('add
+         (unison-ts-mcp-repl--format-result
+          (unison-ts-mcp--call-tool
+           "update-definitions"
+           `((projectContext . ((projectName . ,project-name)
+                                (branchName . ,branch-name)))
+             (code . ((text . ,args)))))))
+        ('test
+         (unison-ts-mcp-repl--format-result
+          (unison-ts-mcp--call-tool
+           "run-tests"
+           `((projectContext . ((projectName . ,project-name)
+                                (branchName . ,branch-name)))
+             ,@(when args `((subnamespace . ,args)))))))
+        ('run
+         (let ((func-name (car args))
+               (func-args (cdr args)))
+           (unison-ts-mcp-repl--format-result
+            (unison-ts-mcp--call-tool
+             "run"
+             `((projectContext . ((projectName . ,project-name)
+                                  (branchName . ,branch-name)))
+               (mainFunctionName . ,func-name)
+               (args . ,(or func-args [])))))))
+        ('view
+         (unison-ts-mcp-repl--format-result
+          (unison-ts-mcp--call-tool
+           "view-definitions"
+           `((projectContext . ((projectName . ,project-name)
+                                (branchName . ,branch-name)))
+             (names . ,args)))))
+        ('find-name
+         (unison-ts-mcp-repl--format-result
+          (unison-ts-mcp--call-tool
+           "search-definitions-by-name"
+           `((projectContext . ((projectName . ,project-name)
+                                (branchName . ,branch-name)))
+             (query . ,args)))))
+        ('find-type
+         (unison-ts-mcp-repl--format-result
+          (unison-ts-mcp--call-tool
+           "search-by-type"
+           `((projectContext . ((projectName . ,project-name)
+                                (branchName . ,branch-name)))
+             (query . ,args)))))
+        ('docs
+         (unison-ts-mcp-repl--format-result
+          (unison-ts-mcp--call-tool
+           "docs"
+           `((projectContext . ((projectName . ,project-name)
+                                (branchName . ,branch-name)))
+             (name . ,args)))))
+        (_
+         (format "Unknown command: %s\nType 'help' for available commands." command))))))
+
+(defun unison-ts-mcp-repl--format-result (result)
+  "Format MCP RESULT for display in REPL."
+  (if result
+      (let* ((content-array (alist-get 'content result))
+             (content (if (vectorp content-array)
+                          (aref content-array 0)
+                        (car content-array)))
+             (text (alist-get 'text content)))
+        (if text
+            (let ((parsed (condition-case nil
+                              (json-read-from-string text)
+                            (error text))))
+              (if (and (listp parsed) (not (stringp parsed)))
+                  ;; Structured response
+                  (let ((errors (alist-get 'errorMessages parsed))
+                        (outputs (alist-get 'outputMessages parsed)))
+                    (concat
+                     (when (and errors (> (length errors) 0))
+                       (concat "Errors:\n"
+                               (mapconcat #'identity (append errors nil) "\n")
+                               "\n"))
+                     (when (and outputs (> (length outputs) 0))
+                       (mapconcat #'identity
+                                  (seq-filter
+                                   (lambda (m) (not (string-match-p "^Loading changes" m)))
+                                   (append outputs nil))
+                                  "\n"))))
+                ;; Plain text
+                (format "%s" parsed)))
+          "(no content)"))
+    "(no result)"))
+
+(defun unison-ts-mcp-repl-send ()
+  "Send current input to UCM via MCP."
+  (interactive)
+  (let* ((input (string-trim (unison-ts-mcp-repl--get-input)))
+         (parsed (unison-ts-mcp-repl--parse-command input)))
+    (let ((inhibit-read-only t))
+      (goto-char (point-max))
+      (insert "\n")
+      (add-text-properties (marker-position unison-ts-mcp-repl--input-start)
+                           (point)
+                           '(read-only t)))
+    (when parsed
+      (condition-case err
+          (let ((result (unison-ts-mcp-repl--execute (car parsed) (cdr parsed))))
+            (unison-ts-mcp-repl--insert-response result))
+        (error
+         (unison-ts-mcp-repl--insert-error (error-message-string err)))))
+    (unison-ts-mcp-repl--insert-prompt)))
+
+(defun unison-ts-mcp-repl--insert-response (response)
+  "Insert MCP RESPONSE into the REPL buffer."
+  (let ((inhibit-read-only t))
+    (goto-char (point-max))
+    (when (and response (not (string-empty-p (string-trim response))))
+      (insert (propertize (string-trim response) 'face 'default) "\n"))))
+
+(defun unison-ts-mcp-repl--insert-error (message)
+  "Insert error MESSAGE into the REPL buffer."
+  (let ((inhibit-read-only t))
+    (goto-char (point-max))
+    (insert (propertize (format "Error: %s\n" message)
+                        'face 'error))))
+
+(defun unison-ts-mcp-repl-clear ()
+  "Clear the MCP REPL buffer."
+  (interactive)
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (unison-ts-mcp-repl--insert-prompt)))
+
+;;; REPL buffer management
 
 (defun unison-ts-repl--buffer-name ()
   "Return the REPL buffer name for the current project."
   (format "*ucm: %s*" (unison-ts-project-name)))
 
 (defun unison-ts-repl--get-buffer ()
-  "Get or create the UCM REPL buffer for the current project.
-Returns nil if UCM process is not running."
+  "Get the UCM REPL buffer for the current project.
+Returns nil if no REPL buffer exists or it's not usable."
   (let* ((root (unison-ts-project-root))
          (buf (gethash root unison-ts-repl--buffers)))
-    (when (and buf (buffer-live-p buf)
-               (get-buffer-process buf))
-      buf)))
+    (when (and buf (buffer-live-p buf))
+      ;; For comint REPL, check process is alive
+      ;; For MCP REPL, buffer being live is sufficient
+      (with-current-buffer buf
+        (if (derived-mode-p 'unison-ts-mcp-repl-mode)
+            buf
+          (when (get-buffer-process buf)
+            buf))))))
 
 (defun unison-ts-repl--start ()
   "Start UCM REPL for the current project.
-Note: Most commands now use MCP and don't require the REPL.
-The REPL is for interactive exploration."
+Uses MCP-based REPL when headless UCM is running (LSP active),
+otherwise starts a subprocess-based REPL."
   (unison-ts--ensure-ucm)
-  (let ((existing-buf (unison-ts--find-ucm-buffer))
+  (let ((existing-buf (unison-ts-repl--get-buffer))
         (lsp-running (unison-ts-api--lsp-running-p)))
     (cond
-     ;; Already have a REPL buffer - just use it
+     ;; Already have a usable REPL buffer
      (existing-buf existing-buf)
-     ;; LSP running - inform user that commands use MCP now
+     ;; LSP running - use MCP REPL (no conflict, MCP coexists with headless)
      (lsp-running
-      (message "Note: LSP is running. Commands like add/update/test use MCP (no conflict).")
-      (message "Starting REPL for interactive use...")
-      (unison-ts-repl--do-start))
-     ;; All clear - start fresh
+      (message "UCM headless detected. Using MCP-based REPL (no lock conflict).")
+      (unison-ts-repl--start-mcp))
+     ;; No LSP - start regular subprocess REPL
      (t
       (unison-ts-repl--do-start)))))
 
+(defun unison-ts-repl--start-mcp ()
+  "Start an MCP-based REPL buffer."
+  (let* ((root (unison-ts-project-root))
+         (buf-name (unison-ts-repl--buffer-name))
+         (buf (get-buffer-create buf-name)))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'unison-ts-mcp-repl-mode)
+        (unison-ts-mcp-repl-mode))
+      (setq unison-ts-mcp-repl--project-root root)
+      (setq default-directory root)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (propertize "UCM MCP REPL - Connected via MCP protocol\n"
+                            'face 'font-lock-comment-face))
+        (insert (propertize (format "Project: %s\n"
+                                    (file-name-nondirectory
+                                     (directory-file-name root)))
+                            'face 'font-lock-comment-face))
+        (insert (propertize "Type 'help' for available commands.\n\n"
+                            'face 'font-lock-comment-face)))
+      (unison-ts-mcp-repl--insert-prompt))
+    (puthash root buf unison-ts-repl--buffers)
+    buf))
+
 (defun unison-ts-repl--do-start ()
-  "Actually start the UCM REPL process."
+  "Start a subprocess-based UCM REPL."
   (let* ((root (unison-ts-project-root))
          (default-directory root)
          (buf-name (unison-ts-repl--buffer-name))
@@ -370,7 +686,10 @@ The REPL is for interactive exploration."
 
 ;;;###autoload
 (defun unison-ts-repl ()
-  "Switch to UCM REPL buffer, starting UCM if needed."
+  "Switch to UCM REPL buffer, starting UCM if needed.
+When headless UCM is running (e.g., via LSP/eglot), uses an
+API-based REPL that communicates via HTTP to avoid codebase
+lock conflicts. Otherwise, starts a traditional subprocess REPL."
   (interactive)
   (let ((buf (or (unison-ts-repl--get-buffer)
                  (unison-ts-repl--start))))
@@ -404,12 +723,20 @@ PROC is the process.  Auto-close buffer on success after
                             (kill-buffer buf))))))))
 
 (defun unison-ts--send-to-repl (command)
-  "Send COMMAND to the UCM REPL, starting it if needed."
+  "Send COMMAND to the UCM REPL, starting it if needed.
+Works with both subprocess-based and MCP-based REPLs."
   (let ((buf (or (unison-ts-repl--get-buffer)
                  (unison-ts-repl--start))))
     (with-current-buffer buf
-      (goto-char (point-max))
-      (comint-send-string (get-buffer-process buf) (concat command "\n")))
+      (if (derived-mode-p 'unison-ts-mcp-repl-mode)
+          ;; MCP REPL - insert command and send
+          (progn
+            (goto-char (point-max))
+            (insert command)
+            (unison-ts-mcp-repl-send))
+        ;; Comint REPL - send to process
+        (goto-char (point-max))
+        (comint-send-string (get-buffer-process buf) (concat command "\n"))))
     (display-buffer buf)))
 
 (defun unison-ts--parse-mcp-output (text)
