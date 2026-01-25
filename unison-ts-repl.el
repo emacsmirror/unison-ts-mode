@@ -64,13 +64,13 @@ Set to nil to disable auto-close."
     (params . ,params)
     (id . ,unison-ts-mcp--request-id)))
 
-(defun unison-ts-mcp--call (requests)
-  "Send REQUESTS to ucm mcp and return list of responses.
+(defun unison-ts-mcp--call (requests &optional callback)
+  "Send REQUESTS to ucm mcp asynchronously.
 REQUESTS is a list of (method . params) cons cells.
-Uses synchronous subprocess call to avoid async complexity."
+CALLBACK is called with the list of responses when complete.
+If CALLBACK is nil, runs synchronously and returns responses."
   (let* ((default-directory (unison-ts-project-root))
          (empty-obj (make-hash-table))
-         ;; Build init request + all other requests
          (init-req (unison-ts-mcp--make-request
                     "initialize"
                     `((protocolVersion . "2024-11-05")
@@ -81,38 +81,71 @@ Uses synchronous subprocess call to avoid async complexity."
                              (mapcar (lambda (r)
                                        (unison-ts-mcp--make-request (car r) (cdr r)))
                                      requests)))
-         ;; Build input string (newline-delimited JSON)
-         (input (mapconcat #'json-encode all-requests "\n"))
-         ;; Call ucm mcp synchronously
-         (output (with-temp-buffer
-                   (let ((exit-code (call-process-region
-                                     input nil
-                                     unison-ts-ucm-executable
-                                     nil t nil
-                                     "mcp")))
-                     (unless (zerop exit-code)
-                       (user-error "UCM MCP failed with exit code %d: %s"
-                                   exit-code (buffer-string)))
-                     (buffer-string))))
-         ;; Parse responses (skip first one which is init response)
-         (lines (split-string output "\n" t))
+         (input (mapconcat #'json-encode all-requests "\n")))
+    (if callback
+        ;; Async mode
+        (let ((output-buffer (generate-new-buffer " *ucm-mcp-output*")))
+          (message "UCM: Processing...")
+          (make-process
+           :name "ucm-mcp"
+           :buffer output-buffer
+           :command (list unison-ts-ucm-executable "mcp")
+           :connection-type 'pipe
+           :sentinel (lambda (proc _event)
+                       (when (memq (process-status proc) '(exit signal))
+                         (let ((responses (unison-ts-mcp--parse-output output-buffer)))
+                           (kill-buffer output-buffer)
+                           (funcall callback responses))))
+           :filter (lambda (proc string)
+                     (with-current-buffer (process-buffer proc)
+                       (goto-char (point-max))
+                       (insert string))))
+          (process-send-string "ucm-mcp" input)
+          (process-send-string "ucm-mcp" "\n")
+          (process-send-eof "ucm-mcp")
+          nil)
+      ;; Sync mode (for REPL)
+      (let ((output (with-temp-buffer
+                      (let ((exit-code (call-process-region
+                                        input nil
+                                        unison-ts-ucm-executable
+                                        nil t nil
+                                        "mcp")))
+                        (unless (zerop exit-code)
+                          (user-error "UCM MCP failed with exit code %d: %s"
+                                      exit-code (buffer-string)))
+                        (buffer-string)))))
+        (unison-ts-mcp--parse-output-string output)))))
+
+(defun unison-ts-mcp--parse-output (buffer)
+  "Parse MCP responses from BUFFER, skipping init response."
+  (with-current-buffer buffer
+    (unison-ts-mcp--parse-output-string (buffer-string))))
+
+(defun unison-ts-mcp--parse-output-string (output)
+  "Parse MCP responses from OUTPUT string, skipping init response."
+  (let* ((lines (split-string output "\n" t))
          (responses (mapcar (lambda (line)
                               (condition-case _err
                                   (json-read-from-string line)
-                                (error
-                                 (message "Warning: Failed to parse MCP response: %s" line)
-                                 nil)))
+                                (error nil)))
                             lines)))
-    ;; Return responses after init (skip first)
     (cdr responses)))
 
-(defun unison-ts-mcp--call-tool (tool-name arguments)
-  "Call MCP tool TOOL-NAME with ARGUMENTS synchronously."
-  (let* ((responses (unison-ts-mcp--call
-                     `(("tools/call" . ((name . ,tool-name)
-                                        (arguments . ,(or arguments (make-hash-table))))))))
-         (response (car responses)))
-    (alist-get 'result response)))
+(defun unison-ts-mcp--call-tool (tool-name arguments &optional callback)
+  "Call MCP tool TOOL-NAME with ARGUMENTS.
+If CALLBACK is provided, runs asynchronously and calls CALLBACK with result.
+Otherwise runs synchronously and returns result."
+  (let ((request `(("tools/call" . ((name . ,tool-name)
+                                    (arguments . ,(or arguments (make-hash-table))))))))
+    (if callback
+        (unison-ts-mcp--call
+         request
+         (lambda (responses)
+           (funcall callback (alist-get 'result (car responses)))))
+      (let* ((responses (unison-ts-mcp--call request))
+             (response (car responses)))
+        (alist-get 'result response)))))
 
 (defun unison-ts-mcp--get-project-context ()
   "Get the current project context (name and branch) via MCP."
@@ -739,40 +772,67 @@ Uses `pop-to-buffer' for errors to ensure visibility."
           (message "UCM: Errors occurred - see buffer"))
       (display-buffer buf))))
 
-(defun unison-ts--update-buffer-definitions (title)
-  "Update definitions from current buffer via MCP, display with TITLE."
+(defun unison-ts--update-buffer-definitions-async (title)
+  "Update definitions from current buffer via MCP asynchronously.
+Displays result with TITLE when complete."
   (unless buffer-file-name
     (user-error "Buffer is not visiting a file"))
-  (let* ((code (buffer-substring-no-properties (point-min) (point-max)))
-         (result (unison-ts-mcp--update-definitions code)))
-    (unison-ts--display-mcp-result result title)))
+  (let ((code (buffer-substring-no-properties (point-min) (point-max)))
+        (ctx (unison-ts-mcp--get-project-context)))
+    (unless ctx
+      (user-error "No Unison project context found. Open a project first"))
+    (let ((project-name (alist-get 'projectName ctx))
+          (branch-name (alist-get 'branchName ctx)))
+      (unison-ts-mcp--call-tool
+       "update-definitions"
+       (append (unison-ts-mcp--make-project-context project-name branch-name)
+               `((code . ((text . ,code)))))
+       (lambda (result)
+         (unison-ts--display-mcp-result result title))))))
 
 ;;;###autoload
 (defun unison-ts-add ()
   "Add definitions from the current file to the codebase via MCP."
   (interactive)
-  (unison-ts--update-buffer-definitions "add"))
+  (unison-ts--update-buffer-definitions-async "add"))
 
 ;;;###autoload
 (defun unison-ts-update ()
   "Update existing definitions in the codebase via MCP."
   (interactive)
-  (unison-ts--update-buffer-definitions "update"))
+  (unison-ts--update-buffer-definitions-async "update"))
 
 ;;;###autoload
 (defun unison-ts-test ()
   "Run tests in the current project via MCP."
   (interactive)
-  (let ((result (unison-ts-mcp--run-tests)))
-    (unison-ts--display-mcp-result result "test")))
+  (let ((ctx (unison-ts-mcp--get-project-context)))
+    (unless ctx
+      (user-error "No Unison project context found. Open a project first"))
+    (unison-ts-mcp--call-tool
+     "run-tests"
+     (unison-ts-mcp--make-project-context
+      (alist-get 'projectName ctx)
+      (alist-get 'branchName ctx))
+     (lambda (result)
+       (unison-ts--display-mcp-result result "test")))))
 
 ;;;###autoload
 (defun unison-ts-run ()
   "Run a term from the codebase via MCP."
   (interactive)
-  (let* ((term (read-string "Term to run: "))
-         (result (unison-ts-mcp--run term)))
-    (unison-ts--display-mcp-result result "run")))
+  (let ((term (read-string "Term to run: "))
+        (ctx (unison-ts-mcp--get-project-context)))
+    (unless ctx
+      (user-error "No Unison project context found. Open a project first"))
+    (unison-ts-mcp--call-tool
+     "run"
+     (append (unison-ts-mcp--make-project-context
+              (alist-get 'projectName ctx)
+              (alist-get 'branchName ctx))
+             `((definition . ,term)))
+     (lambda (result)
+       (unison-ts--display-mcp-result result "run")))))
 
 ;;;###autoload
 (defun unison-ts-watch ()
@@ -780,20 +840,24 @@ Uses `pop-to-buffer' for errors to ensure visibility."
   (interactive)
   (unless buffer-file-name
     (user-error "Buffer is not visiting a file"))
-  (let ((code (buffer-substring-no-properties (point-min) (point-max))))
-    (unison-ts-mcp--with-project-context
-     (lambda (project-name branch-name)
-       (let ((result (unison-ts-mcp--call-tool
-                      "typecheck-code"
-                      (append (unison-ts-mcp--make-project-context project-name branch-name)
-                              `((code . ((text . ,code))))))))
-         (unison-ts--display-mcp-result result "watch"))))))
+  (let ((code (buffer-substring-no-properties (point-min) (point-max)))
+        (ctx (unison-ts-mcp--get-project-context)))
+    (unless ctx
+      (user-error "No Unison project context found. Open a project first"))
+    (unison-ts-mcp--call-tool
+     "typecheck-code"
+     (append (unison-ts-mcp--make-project-context
+              (alist-get 'projectName ctx)
+              (alist-get 'branchName ctx))
+             `((code . ((text . ,code)))))
+     (lambda (result)
+       (unison-ts--display-mcp-result result "watch")))))
 
 ;;;###autoload
 (defun unison-ts-load ()
   "Load current file into the codebase via MCP."
   (interactive)
-  (unison-ts--update-buffer-definitions "load"))
+  (unison-ts--update-buffer-definitions-async "load"))
 
 ;;;###autoload
 (defun unison-ts-send-region (start end)
