@@ -543,17 +543,33 @@ Examples:
 
 (defun unison-ts-repl--get-buffer ()
   "Get the UCM REPL buffer for the current project.
-Returns nil if no REPL buffer exists or it's not usable."
+Returns nil if no REPL buffer exists, it's not usable, or the REPL
+type doesn't match current LSP state."
   (let* ((root (unison-ts-project-root))
-         (buf (gethash root unison-ts-repl--buffers)))
+         (buf (gethash root unison-ts-repl--buffers))
+         (lsp-running (unison-ts-api--lsp-running-p)))
     (when (and buf (buffer-live-p buf))
-      ;; For comint REPL, check process is alive
-      ;; For MCP REPL, buffer being live is sufficient
       (with-current-buffer buf
-        (if (derived-mode-p 'unison-ts-mcp-repl-mode)
-            buf
-          (when (get-buffer-process buf)
-            buf))))))
+        (let ((is-mcp (derived-mode-p 'unison-ts-mcp-repl-mode)))
+          (cond
+           ;; MCP REPL but LSP stopped - need subprocess REPL instead
+           ((and is-mcp (not lsp-running))
+            (kill-buffer buf)
+            (remhash root unison-ts-repl--buffers)
+            nil)
+           ;; Subprocess REPL but LSP started - need MCP REPL instead
+           ((and (not is-mcp) lsp-running)
+            (when-let ((proc (get-buffer-process buf)))
+              (delete-process proc))
+            (kill-buffer buf)
+            (remhash root unison-ts-repl--buffers)
+            nil)
+           ;; MCP REPL and LSP running - good
+           (is-mcp buf)
+           ;; Subprocess REPL and no LSP - check process is alive
+           ((get-buffer-process buf) buf)
+           ;; Subprocess REPL but process dead
+           (t nil)))))))
 
 (defun unison-ts-repl--start ()
   "Start UCM REPL for the current project.
