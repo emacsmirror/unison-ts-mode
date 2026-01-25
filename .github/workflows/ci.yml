@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint (Emacs ${{ matrix.emacs }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs: ['29.1', '29.4']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Emacs
+        uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs }}
+
+      - name: Install package-lint
+        run: |
+          emacs --batch --eval "(progn
+            (require 'package)
+            (add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)
+            (package-initialize)
+            (package-refresh-contents)
+            (package-install 'package-lint))"
+
+      - name: Byte-compile
+        run: |
+          emacs --batch -L . -f batch-byte-compile \
+            unison-ts-mode.el \
+            unison-ts-font-lock.el \
+            unison-ts-indent-rules.el \
+            unison-ts-install.el \
+            unison-ts-repl.el
+
+      - name: Load check
+        run: |
+          emacs --batch -L . --eval '
+          (condition-case err
+              (progn
+                (load "unison-ts-font-lock.el")
+                (load "unison-ts-indent-rules.el")
+                (load "unison-ts-install.el")
+                (load "unison-ts-repl.el")
+                (load "unison-ts-mode.el")
+                (message "All files loaded successfully"))
+            (error
+             (message "Load error: %s" err)
+             (kill-emacs 1)))'
+
+      - name: package-lint
+        run: |
+          emacs --batch -L . --eval "(progn
+            (require 'package-lint)
+            (setq package-lint-main-file \"unison-ts-mode.el\")
+            (let ((errors 0))
+              (dolist (file '(\"unison-ts-mode.el\"
+                              \"unison-ts-font-lock.el\"
+                              \"unison-ts-indent-rules.el\"
+                              \"unison-ts-install.el\"
+                              \"unison-ts-repl.el\"))
+                (with-current-buffer (find-file-noselect file)
+                  (let ((issues (package-lint-buffer)))
+                    (when issues
+                      (dolist (issue issues)
+                        (message \"%s:%d: %s\" file (car issue) (cadr issue)))
+                      (setq errors (+ errors (length issues)))))))
+              (when (> errors 0)
+                (kill-emacs 1))))"
+
+      - name: checkdoc
+        run: |
+          emacs --batch -L . --eval "(progn
+            (require 'checkdoc)
+            (let ((errors nil))
+              (dolist (file '(\"unison-ts-mode.el\"
+                              \"unison-ts-font-lock.el\"
+                              \"unison-ts-indent-rules.el\"
+                              \"unison-ts-install.el\"
+                              \"unison-ts-repl.el\"))
+                (with-current-buffer (find-file-noselect file)
+                  (condition-case err
+                      (checkdoc-current-buffer t)
+                    (error
+                     (message \"checkdoc error in %s: %s\" file err)
+                     (setq errors t)))))
+              (when errors
+                (kill-emacs 1))))"
+
+      - name: Check for forbidden patterns
+        run: |
+          echo "Checking for top-level setq..."
+          if grep -l "^(setq\|^(setq-default" *.el 2>/dev/null; then
+            echo "Found top-level setq/setq-default"
+            exit 1
+          fi
+          echo "Checking for top-level with-eval-after-load..."
+          if grep "^(with-eval-after-load" *.el 2>/dev/null; then
+            echo "Found top-level with-eval-after-load"
+            exit 1
+          fi
+          echo "Pattern checks passed"
+
+  test:
+    name: Test (Emacs ${{ matrix.emacs }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs: ['29.1', '29.4']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Emacs
+        uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs }}
+
+      - name: Install tree-sitter CLI
+        run: |
+          npm install -g tree-sitter-cli
+
+      - name: Build Unison grammar
+        run: |
+          git clone --depth 1 https://github.com/fmguerreiro/tree-sitter-unison.git /tmp/tree-sitter-unison
+          cd /tmp/tree-sitter-unison
+          tree-sitter generate
+          mkdir -p ~/.emacs.d/tree-sitter
+          if [ -f src/parser.c ]; then
+            cc -shared -fPIC -o ~/.emacs.d/tree-sitter/libtree-sitter-unison.so \
+              -I src src/parser.c
+          fi
+
+      - name: Run ERT tests
+        run: |
+          emacs --batch -L . \
+            --eval "(add-to-list 'treesit-extra-load-path \"~/.emacs.d/tree-sitter/\")" \
+            -l ert \
+            -l unison-ts-mode-tests.el \
+            -f ert-run-tests-batch-and-exit
