@@ -555,15 +555,14 @@ Returns nil if no REPL buffer exists or it's not usable."
   "Process object for UCM headless started by us.")
 
 (defun unison-ts--start-ucm-headless ()
-  "Start UCM in headless mode with LSP if not already running.
+  "Start UCM in headless mode if not already running.
 Returns non-nil when UCM headless is ready."
   (unless (unison-ts-api--lsp-running-p)
     (let ((default-directory (unison-ts-project-root)))
       (message "Starting UCM headless...")
       (setq unison-ts--ucm-headless-process
             (start-process "ucm-headless" "*ucm-headless*"
-                           unison-ts-ucm-executable
-                           "--lsp-port" (number-to-string unison-ts-lsp-port)))
+                           unison-ts-ucm-executable "headless"))
       ;; Wait for LSP port to be ready (max 10 seconds)
       (let ((attempts 0))
         (while (and (< attempts 100)
