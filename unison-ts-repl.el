@@ -740,11 +740,17 @@ Short success messages go to minibuffer, errors/long output to a buffer."
                              (lambda (msg)
                                (and (not (string-match-p "^Loading changes" msg))
                                     (not (string-match-p "^No changes found" msg))
+                                    ;; Filter misleading "Run `update`" - MCP already commits
+                                    (not (string-match-p "Run `update` to apply" msg))
                                     (not (member (string-trim msg) error-keys))))
                              (unison-ts--dedupe-messages (alist-get 'outputMessages parsed)))))
               (if (= (length errors) 0)
-                  ;; Success → minibuffer
-                  (message "UCM: %s" (string-join outputs " "))
+                  ;; Success → minibuffer with helpful message
+                  (let ((output-str (string-join outputs " ")))
+                    (if (string-match-p "^\\+" output-str)
+                        ;; Definitions were added - show what was added
+                        (message "UCM: Added definitions. %s" output-str)
+                      (message "UCM: %s" output-str)))
                 ;; Errors → buffer
                 (unison-ts--display-in-buffer title errors outputs)))
           ;; Non-parsed output → buffer
