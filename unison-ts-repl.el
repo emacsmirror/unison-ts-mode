@@ -699,12 +699,14 @@ Short success messages go to minibuffer, errors/long output to a buffer."
     (unison-ts--display-in-buffer title nil (list (format "%S" result)))))
 
 (defun unison-ts--display-in-buffer (title errors outputs)
-  "Display ERRORS and OUTPUTS in a *UCM: TITLE* buffer."
-  (let ((buf (get-buffer-create (format "*UCM: %s*" title))))
+  "Display ERRORS and OUTPUTS in a *UCM: TITLE* buffer.
+Uses `pop-to-buffer' for errors to ensure visibility."
+  (let ((buf (get-buffer-create (format "*UCM: %s*" title)))
+        (has-errors (and errors (> (length errors) 0))))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (when (and errors (> (length errors) 0))
+        (when has-errors
           (insert "⚠️ Errors:\n")
           (seq-do (lambda (msg) (insert msg "\n")) errors)
           (insert "\n"))
@@ -712,7 +714,11 @@ Short success messages go to minibuffer, errors/long output to a buffer."
           (seq-do (lambda (msg) (insert msg "\n")) outputs))
         (goto-char (point-min))
         (special-mode)))
-    (display-buffer buf)))
+    (if has-errors
+        (progn
+          (pop-to-buffer buf)
+          (message "UCM: Errors occurred - see buffer"))
+      (display-buffer buf))))
 
 (defun unison-ts--update-buffer-definitions (title)
   "Update definitions from current buffer via MCP, display with TITLE."
