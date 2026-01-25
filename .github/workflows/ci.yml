@@ -22,15 +22,6 @@ jobs:
         with:
           version: ${{ matrix.emacs }}
 
-      - name: Install package-lint
-        run: |
-          emacs --batch --eval "(progn
-            (require 'package)
-            (add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)
-            (package-initialize)
-            (package-refresh-contents)
-            (package-install 'package-lint))"
-
       - name: Byte-compile
         run: |
           emacs --batch -L . -f batch-byte-compile \
@@ -57,9 +48,15 @@ jobs:
 
       - name: package-lint
         run: |
-          emacs --batch -L . --eval "(progn
+          emacs --batch --eval "(progn
+            (require 'package)
+            (add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)
+            (package-initialize)
+            (package-refresh-contents)
+            (package-install 'package-lint)
             (require 'package-lint)
             (setq package-lint-main-file \"unison-ts-mode.el\")
+            (add-to-list 'load-path \".\")
             (let ((errors 0))
               (dolist (file '(\"unison-ts-mode.el\"
                               \"unison-ts-font-lock.el\"
