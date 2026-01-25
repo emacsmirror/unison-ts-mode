@@ -542,52 +542,52 @@ Examples:
   (format "*ucm: %s*" (unison-ts-project-name)))
 
 (defun unison-ts-repl--get-buffer ()
-  "Get the UCM REPL buffer for the current project.
-Returns nil if no REPL buffer exists, it's not usable, or the REPL
-type doesn't match current LSP state."
+  "Get the UCM MCP REPL buffer for the current project.
+Returns nil if no REPL buffer exists or it's not usable."
   (let* ((root (unison-ts-project-root))
-         (buf (gethash root unison-ts-repl--buffers))
-         (lsp-running (unison-ts-api--lsp-running-p)))
+         (buf (gethash root unison-ts-repl--buffers)))
     (when (and buf (buffer-live-p buf))
       (with-current-buffer buf
-        (let ((is-mcp (derived-mode-p 'unison-ts-mcp-repl-mode)))
-          (cond
-           ;; MCP REPL but LSP stopped - need subprocess REPL instead
-           ((and is-mcp (not lsp-running))
-            (kill-buffer buf)
-            (remhash root unison-ts-repl--buffers)
-            nil)
-           ;; Subprocess REPL but LSP started - need MCP REPL instead
-           ((and (not is-mcp) lsp-running)
-            (when-let ((proc (get-buffer-process buf)))
-              (delete-process proc))
-            (kill-buffer buf)
-            (remhash root unison-ts-repl--buffers)
-            nil)
-           ;; MCP REPL and LSP running - good
-           (is-mcp buf)
-           ;; Subprocess REPL and no LSP - check process is alive
-           ((get-buffer-process buf) buf)
-           ;; Subprocess REPL but process dead
-           (t nil)))))))
+        (when (derived-mode-p 'unison-ts-mcp-repl-mode)
+          buf)))))
+
+(defvar unison-ts--ucm-headless-process nil
+  "Process object for UCM headless started by us.")
+
+(defun unison-ts--start-ucm-headless ()
+  "Start UCM in headless mode with LSP if not already running.
+Returns non-nil when UCM headless is ready."
+  (unless (unison-ts-api--lsp-running-p)
+    (let ((default-directory (unison-ts-project-root)))
+      (message "Starting UCM headless...")
+      (setq unison-ts--ucm-headless-process
+            (start-process "ucm-headless" "*ucm-headless*"
+                           unison-ts-ucm-executable
+                           "--lsp-port" (number-to-string unison-ts-lsp-port)))
+      ;; Wait for LSP port to be ready (max 10 seconds)
+      (let ((attempts 0))
+        (while (and (< attempts 100)
+                    (not (unison-ts-api--lsp-running-p)))
+          (sit-for 0.1)
+          (setq attempts (1+ attempts))))
+      (if (unison-ts-api--lsp-running-p)
+          (message "UCM headless started on port %d" unison-ts-lsp-port)
+        (error "Failed to start UCM headless"))))
+  t)
 
 (defun unison-ts-repl--start ()
   "Start UCM REPL for the current project.
-Uses MCP-based REPL when headless UCM is running (LSP active),
-otherwise starts a subprocess-based REPL."
+Always uses MCP-based REPL. If no UCM headless is running, starts one first.
+This ensures a single UCM process serves both LSP (eglot) and REPL."
   (unison-ts--ensure-ucm)
-  (let ((existing-buf (unison-ts-repl--get-buffer))
-        (lsp-running (unison-ts-api--lsp-running-p)))
+  (let ((existing-buf (unison-ts-repl--get-buffer)))
     (cond
      ;; Already have a usable REPL buffer
      (existing-buf existing-buf)
-     ;; LSP running - use MCP REPL (no conflict, MCP coexists with headless)
-     (lsp-running
-      (message "UCM headless detected. Using MCP-based REPL (no lock conflict).")
-      (unison-ts-repl--start-mcp))
-     ;; No LSP - start regular subprocess REPL
+     ;; Start UCM headless if needed, then use MCP REPL
      (t
-      (unison-ts-repl--do-start)))))
+      (unison-ts--start-ucm-headless)
+      (unison-ts-repl--start-mcp)))))
 
 (defun unison-ts-repl--start-mcp ()
   "Start an MCP-based REPL buffer."
@@ -613,23 +613,12 @@ otherwise starts a subprocess-based REPL."
     (puthash root buf unison-ts-repl--buffers)
     buf))
 
-(defun unison-ts-repl--do-start ()
-  "Start a subprocess-based UCM REPL."
-  (let* ((root (unison-ts-project-root))
-         (default-directory root)
-         (buf-name (unison-ts-repl--buffer-name))
-         (buf (make-comint-in-buffer "ucm" buf-name unison-ts-ucm-executable nil)))
-    (with-current-buffer buf
-      (unison-ts-repl-mode))
-    (puthash root buf unison-ts-repl--buffers)
-    buf))
-
 ;;;###autoload
 (defun unison-ts-repl ()
-  "Switch to UCM REPL buffer, starting UCM if needed.
-When headless UCM is running (e.g., via LSP/eglot), uses an
-MCP-based REPL that communicates via the MCP protocol to avoid
-codebase lock conflicts. Otherwise, starts a traditional subprocess REPL."
+  "Switch to UCM REPL buffer, starting UCM headless if needed.
+Uses MCP protocol to communicate with a single UCM headless process,
+which also serves LSP for eglot. This avoids codebase lock conflicts
+by ensuring only one UCM process runs at a time."
   (interactive)
   (let ((buf (or (unison-ts-repl--get-buffer)
                  (unison-ts-repl--start))))
