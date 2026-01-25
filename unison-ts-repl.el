@@ -29,7 +29,6 @@
 (require 'project)
 (require 'treesit)
 (require 'seq)
-(require 'url)
 
 (defgroup unison-ts-repl nil
   "UCM integration for Unison."
@@ -168,25 +167,7 @@ Signals an error if no project context is found."
       (append (unison-ts-mcp--make-project-context project-name branch-name)
               `((definition . ,definition)))))))
 
-;;; UCM API Integration (Legacy HTTP API)
-;;
-;; When UCM runs in headless mode (e.g., for LSP), it exposes an HTTP API.
-;; These functions allow sending commands via that API instead of spawning
-;; a new UCM process, avoiding codebase lock conflicts.
-
-(defcustom unison-ts-api-port 5858
-  "Port for the UCM codebase server API.
-This is the port UCM headless exposes for HTTP API requests.
-Note: This is different from the LSP port (default 5757)."
-  :type 'integer
-  :group 'unison-ts-repl)
-
-(defcustom unison-ts-api-token nil
-  "Authentication token for UCM API requests.
-If nil, no token is sent.  Set this if UCM was started with --token."
-  :type '(choice (string :tag "Token")
-                 (const :tag "None" nil))
-  :group 'unison-ts-repl)
+;;; UCM Headless Detection
 
 (defcustom unison-ts-api-host "localhost"
   "Host for the UCM codebase server API."
@@ -214,44 +195,6 @@ This is the default port UCM uses for LSP (language server protocol)."
 (defun unison-ts-api--lsp-running-p ()
   "Return non-nil if UCM LSP server is running."
   (unison-ts-api--port-open-p unison-ts-lsp-port))
-
-(defun unison-ts-api--server-running-p ()
-  "Return non-nil if a UCM headless server is accepting connections."
-  (unison-ts-api--port-open-p unison-ts-api-port))
-
-(defun unison-ts-api--get-endpoint ()
-  "Return the UCM API base endpoint URL."
-  (let ((base (format "http://%s:%d" unison-ts-api-host unison-ts-api-port)))
-    (if unison-ts-api-token
-        (format "%s?token=%s" base unison-ts-api-token)
-      base)))
-
-(defvar url-request-method)
-(defvar url-request-extra-headers)
-(defvar url-request-data)
-
-(defun unison-ts-api--call (command)
-  "Send COMMAND to UCM via the HTTP API.
-Returns the response body as a string, or signals an error."
-  (let ((url-request-method "POST")
-        (url-request-extra-headers '(("Content-Type" . "application/json")))
-        (url-request-data (json-encode `((command . ,command))))
-        (endpoint (format "%s/api/ucm/command" (unison-ts-api--get-endpoint))))
-    (let ((buffer (url-retrieve-synchronously endpoint t)))
-      (when buffer
-        (unwind-protect
-            (with-current-buffer buffer
-              (goto-char (point-min))
-              (re-search-forward "^$" nil t)
-              (buffer-substring-no-properties (point) (point-max)))
-          (kill-buffer buffer))))))
-
-(defun unison-ts--send-command (command)
-  "Send COMMAND to UCM, preferring API if headless server is running.
-Falls back to REPL if no headless server is available."
-  (if (unison-ts-api--server-running-p)
-      (unison-ts-api--call command)
-    (unison-ts--send-to-repl command)))
 
 (defun unison-ts-project-root ()
   "Find Unison project root by looking for .unison directory.
@@ -463,79 +406,61 @@ Examples:
 
 (defun unison-ts-mcp-repl--execute (command args)
   "Execute MCP COMMAND with ARGS and return result string."
-  (let* ((default-directory (or unison-ts-mcp-repl--project-root
-                                default-directory))
-         (ctx (unison-ts-mcp--get-project-context)))
-    (unless ctx
-      (user-error "No Unison project context found"))
-    (let ((project-name (alist-get 'projectName ctx))
-          (branch-name (alist-get 'branchName ctx)))
-      (pcase command
-        ('help
-         unison-ts-mcp-repl--help-text)
-        ('watch
-         (unison-ts-mcp-repl--format-result
-          (unison-ts-mcp--call-tool
-           "typecheck-code"
-           `((projectContext . ((projectName . ,project-name)
-                                (branchName . ,branch-name)))
-             (code . ((sourceCode . ,(if (string-prefix-p ">" args)
-                                         args
-                                       (concat "> " args)))))))))
-        ('add
-         (unison-ts-mcp-repl--format-result
-          (unison-ts-mcp--call-tool
-           "update-definitions"
-           `((projectContext . ((projectName . ,project-name)
-                                (branchName . ,branch-name)))
-             (code . ((text . ,args)))))))
-        ('test
-         (unison-ts-mcp-repl--format-result
-          (unison-ts-mcp--call-tool
-           "run-tests"
-           `((projectContext . ((projectName . ,project-name)
-                                (branchName . ,branch-name)))
-             ,@(when args `((subnamespace . ,args)))))))
-        ('run
-         (let ((func-name (car args))
-               (func-args (cdr args)))
-           (unison-ts-mcp-repl--format-result
-            (unison-ts-mcp--call-tool
-             "run"
-             `((projectContext . ((projectName . ,project-name)
-                                  (branchName . ,branch-name)))
-               (mainFunctionName . ,func-name)
-               (args . ,(or func-args [])))))))
-        ('view
-         (unison-ts-mcp-repl--format-result
-          (unison-ts-mcp--call-tool
-           "view-definitions"
-           `((projectContext . ((projectName . ,project-name)
-                                (branchName . ,branch-name)))
-             (names . ,args)))))
-        ('find-name
-         (unison-ts-mcp-repl--format-result
-          (unison-ts-mcp--call-tool
-           "search-definitions-by-name"
-           `((projectContext . ((projectName . ,project-name)
-                                (branchName . ,branch-name)))
-             (query . ,args)))))
-        ('find-type
-         (unison-ts-mcp-repl--format-result
-          (unison-ts-mcp--call-tool
-           "search-by-type"
-           `((projectContext . ((projectName . ,project-name)
-                                (branchName . ,branch-name)))
-             (query . ,args)))))
-        ('docs
-         (unison-ts-mcp-repl--format-result
-          (unison-ts-mcp--call-tool
-           "docs"
-           `((projectContext . ((projectName . ,project-name)
-                                (branchName . ,branch-name)))
-             (name . ,args)))))
-        (_
-         (format "Unknown command: %s\nType 'help' for available commands." command))))))
+  (let ((default-directory (or unison-ts-mcp-repl--project-root
+                               default-directory)))
+    (if (eq command 'help)
+        unison-ts-mcp-repl--help-text
+      (unison-ts-mcp--with-project-context
+       (lambda (project-name branch-name)
+         (let ((ctx (unison-ts-mcp--make-project-context project-name branch-name)))
+           (pcase command
+             ('watch
+              (unison-ts-mcp-repl--format-result
+               (unison-ts-mcp--call-tool
+                "typecheck-code"
+                (append ctx `((code . ((sourceCode . ,(if (string-prefix-p ">" args)
+                                                          args
+                                                        (concat "> " args))))))))))
+             ('add
+              (unison-ts-mcp-repl--format-result
+               (unison-ts-mcp--call-tool
+                "update-definitions"
+                (append ctx `((code . ((text . ,args))))))))
+             ('test
+              (unison-ts-mcp-repl--format-result
+               (unison-ts-mcp--call-tool
+                "run-tests"
+                (append ctx (when args `((subnamespace . ,args)))))))
+             ('run
+              (let ((func-name (car args))
+                    (func-args (cdr args)))
+                (unison-ts-mcp-repl--format-result
+                 (unison-ts-mcp--call-tool
+                  "run"
+                  (append ctx `((mainFunctionName . ,func-name)
+                                (args . ,(or func-args []))))))))
+             ('view
+              (unison-ts-mcp-repl--format-result
+               (unison-ts-mcp--call-tool
+                "view-definitions"
+                (append ctx `((names . ,args))))))
+             ('find-name
+              (unison-ts-mcp-repl--format-result
+               (unison-ts-mcp--call-tool
+                "search-definitions-by-name"
+                (append ctx `((query . ,args))))))
+             ('find-type
+              (unison-ts-mcp-repl--format-result
+               (unison-ts-mcp--call-tool
+                "search-by-type"
+                (append ctx `((query . ,args))))))
+             ('docs
+              (unison-ts-mcp-repl--format-result
+               (unison-ts-mcp--call-tool
+                "docs"
+                (append ctx `((name . ,args))))))
+             (_
+              (format "Unknown command: %s\nType 'help' for available commands." command)))))))))
 
 (defun unison-ts-mcp-repl--format-result (result)
   "Format MCP RESULT for display in REPL."
@@ -789,25 +714,25 @@ Short success messages go to minibuffer, errors/long output to a buffer."
         (special-mode)))
     (display-buffer buf)))
 
+(defun unison-ts--update-buffer-definitions (title)
+  "Update definitions from current buffer via MCP, display with TITLE."
+  (unless buffer-file-name
+    (user-error "Buffer is not visiting a file"))
+  (let* ((code (buffer-substring-no-properties (point-min) (point-max)))
+         (result (unison-ts-mcp--update-definitions code)))
+    (unison-ts--display-mcp-result result title)))
+
 ;;;###autoload
 (defun unison-ts-add ()
   "Add definitions from the current file to the codebase via MCP."
   (interactive)
-  (if (buffer-file-name)
-      (let* ((code (buffer-substring-no-properties (point-min) (point-max)))
-             (result (unison-ts-mcp--update-definitions code)))
-        (unison-ts--display-mcp-result result "add"))
-    (user-error "Buffer is not visiting a file")))
+  (unison-ts--update-buffer-definitions "add"))
 
 ;;;###autoload
 (defun unison-ts-update ()
   "Update existing definitions in the codebase via MCP."
   (interactive)
-  (if (buffer-file-name)
-      (let* ((code (buffer-substring-no-properties (point-min) (point-max)))
-             (result (unison-ts-mcp--update-definitions code)))
-        (unison-ts--display-mcp-result result "update"))
-    (user-error "Buffer is not visiting a file")))
+  (unison-ts--update-buffer-definitions "update"))
 
 ;;;###autoload
 (defun unison-ts-test ()
@@ -828,31 +753,22 @@ Short success messages go to minibuffer, errors/long output to a buffer."
 (defun unison-ts-watch ()
   "Typecheck current file and show results via MCP."
   (interactive)
-  (if buffer-file-name
-      (let* ((code (buffer-substring-no-properties (point-min) (point-max)))
-             (ctx (unison-ts-mcp--get-project-context))
-             (result (unison-ts-mcp--call-tool
+  (unless buffer-file-name
+    (user-error "Buffer is not visiting a file"))
+  (let ((code (buffer-substring-no-properties (point-min) (point-max))))
+    (unison-ts-mcp--with-project-context
+     (lambda (project-name branch-name)
+       (let ((result (unison-ts-mcp--call-tool
                       "typecheck-code"
-                      `((projectContext . ((projectName . ,(alist-get 'projectName ctx))
-                                           (branchName . ,(alist-get 'branchName ctx))))
-                        (code . ((text . ,code)))))))
-        (unison-ts--display-mcp-result result "watch"))
-    (user-error "Buffer is not visiting a file")))
+                      (append (unison-ts-mcp--make-project-context project-name branch-name)
+                              `((code . ((text . ,code))))))))
+         (unison-ts--display-mcp-result result "watch"))))))
 
 ;;;###autoload
 (defun unison-ts-load ()
   "Load current file into the codebase via MCP."
   (interactive)
-  (if buffer-file-name
-      (let* ((code (buffer-substring-no-properties (point-min) (point-max)))
-             (result (unison-ts-mcp--update-definitions code)))
-        (unison-ts--display-mcp-result result "load"))
-    (user-error "Buffer is not visiting a file")))
-
-(defun unison-ts--send-code-via-mcp (code)
-  "Send CODE to UCM via MCP for updating."
-  (let ((result (unison-ts-mcp--update-definitions code)))
-    (unison-ts--display-mcp-result result "eval")))
+  (unison-ts--update-buffer-definitions "load"))
 
 ;;;###autoload
 (defun unison-ts-send-region (start end)
@@ -860,8 +776,9 @@ Short success messages go to minibuffer, errors/long output to a buffer."
   (interactive "r")
   (unless (use-region-p)
     (user-error "No region active"))
-  (let ((text (buffer-substring-no-properties start end)))
-    (unison-ts--send-code-via-mcp text)))
+  (let* ((code (buffer-substring-no-properties start end))
+         (result (unison-ts-mcp--update-definitions code)))
+    (unison-ts--display-mcp-result result "eval")))
 
 (defun unison-ts--definition-node-p (node)
   "Return non-nil if NODE is a Unison definition."
@@ -878,8 +795,9 @@ Short success messages go to minibuffer, errors/long output to a buffer."
     (let ((def-node (treesit-parent-until node #'unison-ts--definition-node-p t)))
       (unless def-node
         (user-error "Point is not within a definition"))
-      (let ((text (treesit-node-text def-node t)))
-        (unison-ts--send-code-via-mcp text)))))
+      (let* ((code (treesit-node-text def-node t))
+             (result (unison-ts-mcp--update-definitions code)))
+        (unison-ts--display-mcp-result result "eval")))))
 
 (provide 'unison-ts-repl)
 
