@@ -14,7 +14,7 @@ The mode is split into focused modules:
 - `unison-ts-font-lock.el` - Tree-sitter font-lock rules using `treesit-font-lock-rules`
 - `unison-ts-indent-rules.el` - Tree-sitter indentation rules
 - `unison-ts-install.el` - Grammar auto-installation
-- `unison-ts-repl.el` - UCM (Unison Codebase Manager) REPL integration via comint
+- `unison-ts-repl.el` - UCM (Unison Codebase Manager) integration via MCP (Model Context Protocol)
 
 ## Development Commands
 
@@ -49,6 +49,7 @@ All under `C-c C-u` prefix:
 - `C-c C-u a` - Add definitions
 - `C-c C-u u` - Update definitions
 - `C-c C-u t` - Run tests
-- `C-c C-u x` - Run a term
-- `C-c C-u w` - Watch current file
-- `C-c C-u l` - Load current file
+- `C-c C-u v` - Evaluate expression (works for pure functions)
+- `C-c C-u x` - Run IO action
+- `C-c C-u w` - Watch/typecheck current file
+- `C-c C-u l` - Load current file into codebase
